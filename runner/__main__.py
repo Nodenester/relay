@@ -66,7 +66,7 @@ async def run(agent_dir: Path) -> int:
         else:
             log.error("config.json missing and no example to copy.")
         return 1
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     setup_logging(config.get("runner", {}).get("log_level", "INFO"))
 
     state_dir = agent_dir / "state"
