@@ -116,9 +116,28 @@ async def run(agent_dir: Path) -> int:
     # uses --resume.
     mark_session_initialized(state_dir)
 
-    dispatcher_task = asyncio.create_task(event_dispatcher(supervisor, bus))
+    # stdout reader must be alive before we send bootstrap messages so we
+    # can detect their turn boundaries.
     stdout_task = asyncio.create_task(supervisor.read_stdout_loop())
     stderr_task = asyncio.create_task(supervisor.read_stderr_loop())
+
+    # Send any one-time bootstrap messages (e.g. /remote-control <name>) as
+    # raw user turns BEFORE the regular event dispatcher starts. This way
+    # they arrive without a [FROM ...] source prefix, so slash commands and
+    # other Claude-Code-native syntax parse correctly.
+    bootstrap_msgs = config.get("runner", {}).get("bootstrap_messages", [])
+    for msg in bootstrap_msgs:
+        try:
+            await asyncio.wait_for(supervisor.turn_complete.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            log.warning("Timed out waiting for turn boundary before bootstrap; sending anyway")
+        try:
+            await supervisor.send_user_message(msg)
+            log.info("Sent bootstrap message: %r", msg[:80])
+        except Exception:
+            log.exception("Failed to send bootstrap message: %r", msg[:80])
+
+    dispatcher_task = asyncio.create_task(event_dispatcher(supervisor, bus))
 
     # Handle shutdown gracefully
     stop_event = asyncio.Event()

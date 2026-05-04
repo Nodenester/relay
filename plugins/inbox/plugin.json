@@ -1,0 +1,5 @@
+{
+  "name": "inbox",
+  "module": "plugin",
+  "description": "File-tailed inbox. Appends one JSON line per message to state/inbox.jsonl; the plugin polls the file and emits each new line as an event. Used by the relay-tell CLI helper to inject ad-hoc user messages."
+}

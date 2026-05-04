@@ -43,6 +43,25 @@ cd E:\Repos\relay
 Edit `CLAUDE.md` for persona + rules. Edit `config.json` for plugin
 settings. Delete any plugin folder you don't use.
 
+## Bootstrap messages
+
+Optionally send one or more user messages on startup *before* normal
+event dispatch begins. Useful for slash commands like `/remote-control`
+that need to be the first thing Claude sees. Configure in `runner`:
+
+```json
+"runner": {
+  "mcp_port": 9123,
+  "log_level": "INFO",
+  "bootstrap_messages": ["/remote-control my-relay-agent"]
+}
+```
+
+These bypass the `[FROM ...]` source prefix that regular plugin events
+get, so slash commands and other special syntax parse correctly. They
+fire exactly once per session start, sequentially, with a wait for the
+prior turn to complete between each.
+
 ## Event flow
 
 When a plugin calls `api.emit(body, metadata)`, an `Event` enters the

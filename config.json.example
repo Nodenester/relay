@@ -5,7 +5,8 @@
   },
   "runner": {
     "mcp_port": 9123,
-    "log_level": "INFO"
+    "log_level": "INFO",
+    "bootstrap_messages": []
   },
   "plugins": {
     "discord": {
