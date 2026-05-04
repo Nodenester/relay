@@ -9,8 +9,8 @@ import signal
 import sys
 from pathlib import Path
 
-from .event_bus import EventBus
-from .mcp_server import build_mcp, serve_mcp_http
+from .event_bus import EventBus, Event
+from .mcp_server import build_mcp, send_channel_event, serve_mcp_http
 from .plugin_api import RegisteredTool
 from .plugin_loader import load_plugins
 from .supervisor import (
@@ -31,33 +31,36 @@ def setup_logging(level: str) -> None:
     )
 
 
-async def event_dispatcher(supervisor: ClaudeSupervisor, bus: EventBus) -> None:
-    """Wait for turn boundaries, then flush queued events as a single user message."""
+async def event_dispatcher(bus: EventBus) -> None:
+    """Drain plugin events and inject them as channel notifications.
+
+    Each plugin event becomes one `notifications/claude/channel` push.
+    Claude receives them as `<channel source="...">` user turns inside
+    its always-running interactive session.
+
+    No turn-boundary tracking is needed in interactive mode — Claude
+    queues incoming channel events and processes them as turns finish.
+    """
     while True:
-        first = await bus.get()
+        event = await bus.get()
         rest = bus.drain_nowait()
-        pending = [first, *rest]
-        # Wait for Claude to be idle before sending.
-        await supervisor.turn_complete.wait()
-        if len(pending) == 1:
-            content = pending[0].to_user_message()
-        else:
-            content = "\n\n---\n\n".join(ev.to_user_message() for ev in pending)
-            content = (
-                f"[BATCH: {len(pending)} events arrived together]\n\n"
-                + content
+        events = [event, *rest]
+
+        for ev in events:
+            ok = await send_channel_event(
+                text=ev.body,
+                source=ev.source,
+                chat_id=ev.source,
+                extra_meta=dict(ev.metadata or {}),
             )
-        try:
-            await supervisor.send_user_message(content)
-        except Exception:
-            log.exception("Failed to send user message; requeueing")
-            for ev in pending:
+            if not ok:
+                # No live MCP session yet — requeue and back off briefly.
                 await bus.put(ev)
-            await asyncio.sleep(2.0)
+                await asyncio.sleep(2.0)
+                break
 
 
 async def run(agent_dir: Path) -> int:
-    # Load config
     config_path = agent_dir / "config.json"
     if not config_path.exists():
         example = agent_dir / "config.json.example"
@@ -79,7 +82,6 @@ async def run(agent_dir: Path) -> int:
     tool_registry: list[RegisteredTool] = []
     plugin_tasks: list[asyncio.Task] = []
 
-    # Load plugins
     plugins_dir = agent_dir / "plugins"
     loaded = await load_plugins(
         plugins_dir=plugins_dir,
@@ -92,7 +94,7 @@ async def run(agent_dir: Path) -> int:
     log.info("Registered %d tool(s): %s", len(tool_registry),
              [t.name for t in tool_registry])
 
-    # Build MCP
+    # Build the MCP server (now also serving as the channel — see mcp_server.py)
     mcp = build_mcp(tool_registry)
     mcp_port = int(config.get("runner", {}).get("mcp_port", 9123))
     mcp_task = asyncio.create_task(serve_mcp_http(mcp, "127.0.0.1", mcp_port))
@@ -100,44 +102,29 @@ async def run(agent_dir: Path) -> int:
     # Give the MCP a moment to bind.
     await asyncio.sleep(1.0)
 
-    # Spawn Claude
+    # Spawn Claude interactively (PTY-wrapped, no visible window).
+    runner_cfg = config.get("runner", {})
+    claude_cfg = config.get("claude", {})
+    remote_name = runner_cfg.get("remote_control_name")
+    if remote_name is None:
+        # Default: derive a sensible name from the agent dir.
+        remote_name = f"relay-{agent_dir.name}"
     supervisor = ClaudeSupervisor(SupervisorConfig(
         agent_dir=agent_dir,
         session_id=session_id,
         mcp_port=mcp_port,
-        model=config.get("claude", {}).get("model", "opus"),
-        additional_args=config.get("claude", {}).get("additional_args", []),
-        log_file=state_dir / "logs" / "claude_stream.jsonl",
+        model=claude_cfg.get("model", "opus"),
+        remote_control_name=remote_name,
+        additional_args=claude_cfg.get("additional_args", []),
+        log_file=state_dir / "logs" / "claude_pty.log",
         is_first_run=is_first_run,
     ))
     await supervisor.start()
-    log.info("Claude supervisor started (pid=%s)", supervisor.proc.pid)
-    # After successful start, mark session as initialized so the next run
-    # uses --resume.
+    log.info("Claude supervisor started (pid=%s, remote-control name=%r)",
+             supervisor.proc.pid if supervisor.proc else "?", remote_name)
     mark_session_initialized(state_dir)
 
-    # stdout reader must be alive before we send bootstrap messages so we
-    # can detect their turn boundaries.
-    stdout_task = asyncio.create_task(supervisor.read_stdout_loop())
-    stderr_task = asyncio.create_task(supervisor.read_stderr_loop())
-
-    # Send any one-time bootstrap messages (e.g. /remote-control <name>) as
-    # raw user turns BEFORE the regular event dispatcher starts. This way
-    # they arrive without a [FROM ...] source prefix, so slash commands and
-    # other Claude-Code-native syntax parse correctly.
-    bootstrap_msgs = config.get("runner", {}).get("bootstrap_messages", [])
-    for msg in bootstrap_msgs:
-        try:
-            await asyncio.wait_for(supervisor.turn_complete.wait(), timeout=60)
-        except asyncio.TimeoutError:
-            log.warning("Timed out waiting for turn boundary before bootstrap; sending anyway")
-        try:
-            await supervisor.send_user_message(msg)
-            log.info("Sent bootstrap message: %r", msg[:80])
-        except Exception:
-            log.exception("Failed to send bootstrap message: %r", msg[:80])
-
-    dispatcher_task = asyncio.create_task(event_dispatcher(supervisor, bus))
+    dispatcher_task = asyncio.create_task(event_dispatcher(bus))
 
     # Handle shutdown gracefully
     stop_event = asyncio.Event()
@@ -153,12 +140,13 @@ async def run(agent_dir: Path) -> int:
 
     # Shutdown only fires on:
     # - explicit stop_event (SIGINT/SIGTERM)
-    # - Claude stdout closed (supervisor died)
+    # - Claude PTY closed (supervisor died)
     # - MCP server died
     # - dispatcher crashed
     # Plugin tasks that complete on their own (e.g. one-shot triggers)
     # should NOT shut down the runner.
-    critical_tasks = [dispatcher_task, stdout_task, stderr_task, mcp_task]
+    supervisor_wait = asyncio.create_task(supervisor.wait())
+    critical_tasks = [dispatcher_task, supervisor_wait, mcp_task]
     stop_watcher = asyncio.create_task(stop_event.wait())
 
     done, pending = await asyncio.wait(

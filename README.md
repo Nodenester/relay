@@ -1,37 +1,65 @@
 # relay
 
 A lightweight two-way runner for Claude Code. Wraps one persistent
-`claude --resume` session and plumbs external events into it as user
-messages while routing Claude's tool calls back to plugin handlers — all
-through a single local MCP server.
+**interactive** Claude Code session and plumbs external events into it
+via the native channel mechanism, while routing tool calls back to
+plugin handlers through a single local MCP server.
+
+The same MCP server doubles as the **channel** (declares
+`experimental.claude/channel` capability), so there's exactly one
+process to run, one port to bind, no plugin to install. The session
+also auto-enables Claude Code's **Remote Control**, so you can attach
+from `claude.ai/code` on any device — phone, laptop, anywhere.
 
 ```
-triggers (plugins) ──> event queue ──> persistent `claude --resume`
-                                              │
-                                              ▼
-                                       tool calls back to
-                                       runner's aggregating
-                                       MCP (localhost HTTP)
-                                              │
-                                              ▼
-                                       dispatched to plugin
-                                       tool handlers
+                  ┌────────────────────────────────────────────────┐
+                  │ relay process (Python)                         │
+plugins ─emit──>  │  event bus → dispatcher                        │
+                  │                  │                             │
+                  │                  │ notifications/claude/channel│
+                  │                  ▼                             │
+                  │   FastMCP (HTTP, port 9301) + channel cap      │
+                  └────────────────────────────────────────────────┘
+                                     │
+                                     ▼ (HTTP, MCP-over-streamable)
+                  ┌────────────────────────────────────────────────┐
+                  │ claude (interactive, PTY-wrapped, hidden)      │
+                  │  --dangerously-load-development-channels       │
+                  │     server:relay                               │
+                  │  --remote-control <name>                       │
+                  │  --resume <UUID>                               │
+                  └────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+                            claude.ai/code (web)
+                            user attaches remotely
 ```
 
-- **One persistent session.** Prompt cache stays warm, conversation
-  continuity is native, no spawn-per-event.
-- **Plugins are folders in `plugins/`.** Triggers and tools auto-discovered
-  at startup. No runner edits when you add or delete one.
-- **Generic plugins for almost anything.** `poller/` runs any shell command
-  on a schedule; `webhook/` listens on any port — you rarely need to write
-  Python for a new trigger source.
-- **One MCP, all tools.** Claude Code connects to a single local MCP that
-  aggregates every plugin's tools. Every call is observable and logged.
-- **Autostarts on login** via Windows Task Scheduler. Restarts on crash.
+- **One persistent session.** Prompt cache stays warm. Lives forever in
+  a hidden ConPTY (no visible window).
+- **Native Claude Code Remote Control.** Pass `--remote-control <name>`
+  in config and the agent shows up at `claude.ai/code`. No bot, no
+  custom web UI, no auth boilerplate.
+- **Native Channel mechanism.** Plugin events arrive as
+  `<channel source="...">` user turns via MCP `notifications/claude/channel`.
+  No extra plugin to write, no extra port — relay's existing MCP server
+  doubles as the channel.
+- **Plugins are folders in `plugins/`.** Triggers and tools auto-discovered.
+  No runner edits when you add or delete one.
+- **Generic plugins**: `poller/` (any shell command on a schedule),
+  `webhook/` (HTTP listener), `inbox/` (file-tailed message injection),
+  plus per-source plugins for `github`, `outlook`, `signal`, `discord`.
+- **Autostarts on login** via Windows Task Scheduler.
 - **Autonomous by default** (`--dangerously-skip-permissions`). Safety
   moves to `CLAUDE.md` rules.
-- **No runtime dependencies on a backend.** Just `claude` CLI + Python +
-  whatever plugins you enable.
+
+## Requirements
+
+- Windows (the supervisor uses ConPTY via `pywinpty`); macOS/Linux
+  support possible by swapping the PTY backend.
+- Python 3.12+
+- `claude` CLI authenticated with a Claude subscription (Max recommended).
+- `pip install -r requirements.txt`
 
 ## Install
 
@@ -40,55 +68,84 @@ cd E:\Repos\relay
 .\install.ps1
 ```
 
-Edit `CLAUDE.md` for persona + rules. Edit `config.json` for plugin
-settings. Delete any plugin folder you don't use.
+Edit `CLAUDE.md` for the agent's persona + rules. Edit `config.json` for
+plugin settings.
 
-## Bootstrap messages
-
-Optionally send one or more user messages on startup *before* normal
-event dispatch begins. Useful for slash commands like `/remote-control`
-that need to be the first thing Claude sees. Configure in `runner`:
+## Config — minimum
 
 ```json
-"runner": {
-  "mcp_port": 9123,
-  "log_level": "INFO",
-  "bootstrap_messages": ["/remote-control my-relay-agent"]
+{
+  "claude": {
+    "model": "sonnet",
+    "additional_args": []
+  },
+  "runner": {
+    "mcp_port": 9301,
+    "log_level": "INFO",
+    "remote_control_name": "my-agent"
+  },
+  "plugins": {
+    "inbox": {
+      "enabled": true,
+      "path": "state/inbox.jsonl",
+      "poll_sec": 2,
+      "default_source": "user"
+    }
+  }
 }
 ```
 
-These bypass the `[FROM ...]` source prefix that regular plugin events
-get, so slash commands and other special syntax parse correctly. They
-fire exactly once per session start, sequentially, with a wait for the
-prior turn to complete between each.
+If `remote_control_name` is omitted it defaults to `relay-<dir-name>`.
 
 ## Event flow
 
-When a plugin calls `api.emit(body, metadata)`, an `Event` enters the
-queue. The dispatcher waits for the current Claude turn to finish
-(`type:result` on stdout) and then drains everything queued in one go,
-sending it as a single user message:
-
 ```
-[FROM github | repo=your-org/your-repo | type=Issue]
-Issue #42: orders page broken on mobile
-…
+plugin → api.emit(body, metadata) → event_bus
+                                        │
+                                        ▼
+                                  event_dispatcher
+                                        │
+                                        ▼ send_channel_event
+                                MCP notifications/claude/channel
+                                        │
+                                        ▼
+                            claude session sees:
+                            <channel source="github_watcher"
+                                     chat_id="..."
+                                     message_id="...">
+                              <event body>
+                            </channel>
 ```
 
-If multiple events arrive together they're concatenated under a
-`[BATCH: N events arrived together]` header so Claude sees them grouped
-without fragmenting turns.
+Multiple events arriving in quick succession are pushed individually as
+separate channel notifications. Claude's session naturally serializes
+them as user turns.
+
+## Talking to a relay agent
+
+External (other process or shell):
+
+```bash
+# append a JSON line to the inbox
+echo '{"body": "what is on my plate?", "source": "user"}' >> state/inbox.jsonl
+# the inbox plugin tails this file every 2 sec; the line arrives as a turn
+```
+
+Remotely (phone, laptop, anywhere): open `claude.ai/code` while logged
+in to your Claude account, find the session named whatever you set as
+`remote_control_name`. Type and reply as if you were at the keyboard.
 
 ## Built-in plugins
 
 | Plugin | Purpose |
 |--------|---------|
-| `discord/` | Bi-directional chat in a specific channel. |
+| `discord/` | Bidirectional chat in a specific channel. |
 | `outlook/` | Outlook Classic via the separately-installed `outlook-mcp-server`. |
 | `github/` | Notifications poller + per-repo watchers (issues / runs / PRs). |
 | `signal/` | Signal Note-to-Self via `signal-cli`. |
-| `poller/` | **Generic** — runs any shell command on a schedule. |
-| `webhook/` | **Generic** — HTTP listener with optional HMAC verification. |
+| `inbox/` | File-tailed message injection (the `state/inbox.jsonl` channel). |
+| `poller/` | Generic — runs any shell command on a schedule. |
+| `webhook/` | Generic — HTTP listener with optional HMAC verification. |
 | `_template/` | Skeleton for new plugins. |
 
 ## github watchers
@@ -126,25 +183,8 @@ emits a separate event for every new item.
 }
 ```
 
-| Field | Required | Default | Notes |
-|-------|----------|---------|-------|
-| `name` | yes | — | Unique per watcher; used in state filename. |
-| `kind` | yes | — | `issues`, `runs`, or `pulls`. |
-| `repo` | yes | — | `owner/name`. |
-| `filter` | no | `""` | Raw extra `gh` args (`--label …`, `--state …`, `--search …`). |
-| `poll_sec` | no | 300 | Min 10. |
-| `template` | no | per-kind default | See per-kind fields below. |
-
-Template fields available per kind:
-
-- **issues**: `number`, `title`, `body`, `labels` (joined), `author`,
-  `createdAt`, `updatedAt`, `url`, `state`, `repo`.
-- **runs**: `databaseId`, `name`, `displayTitle`, `status`, `conclusion`,
-  `headBranch`, `headSha`, `event`, `workflowName`, `url`, `createdAt`,
-  `updatedAt`, `repo`.
-- **pulls**: `number`, `title`, `body`, `labels`, `author`,
-  `baseRefName`, `headRefName`, `state`, `url`, `createdAt`,
-  `updatedAt`, `isDraft`, `repo`.
+Available kinds: `issues`, `runs`, `pulls`. Each item's gh-JSON fields
+are exposed to the optional `template` for custom rendering.
 
 ## Generic poller
 
@@ -167,17 +207,6 @@ arbitrary shell command on a schedule and emits each new item.
 }
 ```
 
-| Field | Default | Notes |
-|-------|---------|-------|
-| `command` | — | Shell command. Pipes/redirects need `shell: true`. |
-| `shell` | `false` | If true, runs via system shell. |
-| `mode` | `"json"` | `json` parses stdout as a JSON array; `lines` treats each line as one item. |
-| `id_field` | — | Required for `json`. Dotted path, e.g. `metadata.uid`. |
-| `match` | `null` | Optional regex; only items whose JSON contains a match are emitted. |
-| `poll_sec` | 300 | Min 5. |
-| `timeout_sec` | 60 | Per-poll command timeout. |
-| `template` | `"{_raw}"` | Dotted access, missing keys render literally. |
-
 ## Generic webhook
 
 HTTP listener for true push triggers (no polling lag). Optional
@@ -194,31 +223,9 @@ GitHub-style HMAC-SHA256 verification per endpoint.
       "path": "/github",
       "secret_env": "RELAY_GITHUB_WEBHOOK_SECRET",
       "template": "GitHub event {header.x-github-event} on {payload.repository.full_name}\n{body}"
-    },
-    {
-      "name": "generic",
-      "path": "/in",
-      "template": "{body}"
     }
   ]
 }
-```
-
-Template fields: `{body}` (raw), `{header.<name>}` (lower-case),
-`{payload.<dotted.path>}` (JSON-decoded body), `{query.<name>}`,
-`{path}`, `{method}`. HMAC-mismatched requests get 401 and are not
-emitted.
-
-For GitHub webhooks, expose the port via cloudflared / Tailscale Funnel /
-ngrok and register the URL on the repo:
-
-```bash
-gh api -X POST repos/OWNER/REPO/hooks \
-  -f name=web -f active=true \
-  -F 'events[]=issues' -F 'events[]=pull_request' \
-  -F 'config[url]=https://YOUR-TUNNEL/github' \
-  -F 'config[content_type]=json' \
-  -F 'config[secret]=<same as RELAY_GITHUB_WEBHOOK_SECRET>'
 ```
 
 ## Writing a plugin
@@ -226,11 +233,10 @@ gh api -X POST repos/OWNER/REPO/hooks \
 A plugin is a folder under `plugins/` with a `plugin.json` and a Python
 module. Two supported modes:
 
-- **inproc** — a Python module with `async def setup(api)` that
-  registers tools and background tasks. Runs inside the runner's event
-  loop.
-- **proxy** — point `plugin.json` at a pre-built MCP server binary
-  (e.g. outlook-mcp-server). The runner forwards tool calls and
+- **inproc** — Python module with `async def setup(api)` that registers
+  tools and background tasks. Runs inside the runner's event loop.
+- **proxy** — `plugin.json` points at a pre-built MCP server binary
+  (e.g. `outlook-mcp-server`). The runner forwards tool calls and
   namespaces them under the plugin name.
 
 See `plugins/_template/` for the skeleton. The plugin folder is treated
@@ -239,4 +245,4 @@ separate `watcher.py`) work naturally with relative imports.
 
 ## Status
 
-Alpha. Tested locally. License: MIT.
+Beta. License: MIT.
