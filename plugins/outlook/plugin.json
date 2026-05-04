@@ -1,0 +1,5 @@
+{
+  "name": "outlook",
+  "module": "plugin",
+  "description": "Polls Outlook Classic inbox via COM. Emits events for new mail. Tool surface comes from the separately-installed outlook-mcp-server (registered globally)."
+}

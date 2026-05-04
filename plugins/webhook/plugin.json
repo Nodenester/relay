@@ -1,0 +1,5 @@
+{
+  "name": "webhook",
+  "module": "plugin",
+  "description": "Generic HTTP webhook receiver. Listens on a configured host/port and emits an event for every POST to a configured path. Supports GitHub-style HMAC-SHA256 signature verification (X-Hub-Signature-256) when a secret env var is set."
+}

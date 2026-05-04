@@ -1,0 +1,5 @@
+{
+  "name": "discord",
+  "module": "bot",
+  "description": "Bi-directional Discord chat in a single channel. Input: messages in the watched channel become events. Output: relay.discord_send tool posts to the channel."
+}

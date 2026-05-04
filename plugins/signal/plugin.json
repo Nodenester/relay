@@ -1,0 +1,5 @@
+{
+  "name": "signal",
+  "module": "plugin",
+  "description": "Signal Note-to-Self trigger + send tool via signal-cli. User messages themselves on Signal mobile, Claude reads and can reply. Loop prevention via zero-width marker on outbound."
+}

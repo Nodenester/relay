@@ -1,0 +1,97 @@
+{
+  "claude": {
+    "model": "opus",
+    "additional_args": []
+  },
+  "runner": {
+    "mcp_port": 9123,
+    "log_level": "INFO"
+  },
+  "plugins": {
+    "discord": {
+      "enabled": true,
+      "token": "YOUR_BOT_TOKEN_HERE",
+      "channel_id": 0
+    },
+    "outlook": {
+      "enabled": false,
+      "poll_sec": 120,
+      "mcp_command": ["PATH/TO/outlook-mcp-server.exe"]
+    },
+    "github": {
+      "enabled": false,
+      "notifications": {
+        "enabled": true,
+        "poll_sec": 300
+      },
+      "watchers": [
+        {
+          "name": "queued-issues",
+          "kind": "issues",
+          "repo": "your-org/your-repo",
+          "filter": "--label ai:queued --state open",
+          "poll_sec": 120
+        },
+        {
+          "name": "ci-failures",
+          "kind": "runs",
+          "repo": "your-org/your-repo",
+          "filter": "--status failure --branch main --limit 20",
+          "poll_sec": 300
+        },
+        {
+          "name": "review-requests",
+          "kind": "pulls",
+          "repo": "your-org/your-repo",
+          "filter": "--search review-requested:@me --state open",
+          "poll_sec": 600
+        }
+      ]
+    },
+    "signal": {
+      "enabled": false,
+      "number": "+1234567890",
+      "poll_sec": 30
+    },
+    "poller": {
+      "enabled": false,
+      "targets": [
+        {
+          "name": "k8s-failed-pods",
+          "command": "kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o json | jq '.items'",
+          "shell": true,
+          "id_field": "metadata.uid",
+          "poll_sec": 120,
+          "template": "Failed pod: {metadata.namespace}/{metadata.name}\nReason: {status.reason}"
+        },
+        {
+          "name": "disk-low",
+          "command": "df -h --output=source,pcent /",
+          "shell": true,
+          "mode": "lines",
+          "poll_sec": 300,
+          "template": "{line}",
+          "match": "9[0-9]%|100%"
+        }
+      ]
+    },
+    "webhook": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 7700,
+      "endpoints": [
+        {
+          "name": "github-push",
+          "path": "/github",
+          "secret_env": "RELAY_GITHUB_WEBHOOK_SECRET",
+          "template": "GitHub event {header.x-github-event} on {payload.repository.full_name}\n{body}"
+        },
+        {
+          "name": "generic",
+          "path": "/in",
+          "template": "{body}"
+        }
+      ]
+    }
+  }
+}

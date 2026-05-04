@@ -1,0 +1,5 @@
+{
+  "name": "github",
+  "module": "plugin",
+  "description": "Polls `gh api notifications`. Emits events for new mentions, review requests, assignments. Requires `gh` CLI to be installed and authenticated."
+}

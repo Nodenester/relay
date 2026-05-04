@@ -1,0 +1,5 @@
+{
+  "name": "_template",
+  "module": "plugin",
+  "description": "Skeleton — copy this folder, rename, enable in config.json"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "testplug",
+  "module": "plugin",
+  "description": "Integration test plugin. Emits a known marker event on startup and exposes a test tool. Only enable when testing the runner."
+}

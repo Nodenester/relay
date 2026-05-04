@@ -1,0 +1,5 @@
+{
+  "name": "poller",
+  "module": "plugin",
+  "description": "Generic shell-command poller. Runs any command on a schedule and emits an event for each new line or JSON-array element. Supports multiple independent targets with per-target seen-set, regex filtering, and templated message rendering."
+}
