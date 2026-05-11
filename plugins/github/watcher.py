@@ -52,6 +52,27 @@ _ID_FIELD = {
     "pulls": "number",
 }
 
+
+def _dedup_key(kind: str, item: dict) -> str | None:
+    """Stable per-event key for dedup.
+
+    For pulls, include updatedAt so PR updates (new commits, comments, label
+    changes) re-trigger the watcher -- otherwise once a PR is seen it's never
+    looked at again, even when the coder pushes follow-up fixes addressing
+    reviewer feedback.
+
+    For issues, we similarly include updatedAt because issue comments matter.
+
+    For runs, the bare databaseId is enough -- each workflow run is unique.
+    """
+    base = item.get(_ID_FIELD[kind])
+    if base is None:
+        return None
+    if kind in ("pulls", "issues"):
+        updated = item.get("updatedAt", "")
+        return f"{base}@{updated}"
+    return str(base)
+
 _DEFAULT_TEMPLATE = {
     "issues": (
         "Issue #{number} ({state}): {title}\n"
@@ -269,10 +290,9 @@ async def run_watcher(api, cfg: WatcherConfig, state_dir: Path) -> None:
         new_items: list[dict] = []
         id_field = _ID_FIELD[cfg.kind]
         for item in items:
-            ident = item.get(id_field)
-            if ident is None:
+            key = _dedup_key(cfg.kind, item)
+            if key is None:
                 continue
-            key = str(ident)
             if key in seen:
                 continue
             seen.add(key)
